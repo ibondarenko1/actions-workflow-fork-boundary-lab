@@ -12,7 +12,7 @@ permissions:
 jobs:
   inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -21,10 +21,10 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Pack and inspect vulnerable and current releases
+      - name: Pack and inspect Linux x64 runtimes
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
           mkdir -p inspect
 
           inspect_version() {
@@ -33,41 +33,36 @@ jobs:
             mkdir -p "$out"
             pushd "$out" >/dev/null
 
-            echo "$version" > requested-version.txt
-            if ! npm pack "@github/copilot@$version" --json > npm-pack.json 2> npm-pack.err; then
-              echo "npm pack failed for $version" | tee status.txt
-              cat npm-pack.err
-              popd >/dev/null
-              return 0
-            fi
-
+            npm pack "@github/copilot-linux-x64@$version" --json > npm-pack.json
             pkg="$(node -e "const x=require('./npm-pack.json'); console.log(x[0].filename)")"
             sha256sum "$pkg" > package-sha256.txt
             mkdir package
             tar -xzf "$pkg" -C package --strip-components=1
+            rm -f "$pkg"
 
             node -e "const p=require('./package/package.json'); console.log(JSON.stringify(p,null,2))" > package-json-normalized.txt
             find package -type f -printf '%s\t%p\n' | sort -n > tree.txt
             find package -type f -print0 | xargs -0 file > filetypes.txt
-
-            : > grep-source.txt
-            find package -type f \( -name '*.js' -o -name '*.cjs' -o -name '*.mjs' -o -name '*.json' -o -name '*.ts' -o -name '*.map' \) -print0 |
-              xargs -0 -r grep -a -n -E -i 'serverName|toolName|permission|approval|custom-tool|extension-management|kind.{0,20}mcp|kind.{0,20}shell|mcp.{0,50}shell|shell.{0,50}mcp' >> grep-source.txt || true
+            find package -type f -executable -printf '%p\n' > executables.txt
+            while IFS= read -r f; do sha256sum "$f"; done < executables.txt > executable-sha256.txt
 
             : > strings-filtered.txt
             while IFS= read -r -d '' f; do
               size=$(stat -c %s "$f")
-              if [ "$size" -le 250000000 ]; then
-                matches=$(LC_ALL=C strings -a "$f" | grep -E -i 'serverName|toolName|permission|approval|custom-tool|extension-management|kind.{0,20}mcp|kind.{0,20}shell|mcp.{0,50}shell|shell.{0,50}mcp' | head -n 20000 || true)
-                if [ -n "$matches" ]; then
-                  printf '\n===== %s =====\n%s\n' "$f" "$matches" >> strings-filtered.txt
-                fi
+              if [ "$size" -le 300000000 ]; then
+                LC_ALL=C strings -a "$f" |
+                  grep -E -i 'serverName|toolName|permission|approval|custom-tool|extension-management|kind.{0,30}mcp|kind.{0,30}shell|mcp.{0,80}shell|shell.{0,80}mcp|permission.*rule|rule.*permission' |
+                  head -n 100000 >> strings-filtered.txt || true
               fi
             done < <(find package -type f -print0)
 
-            grep -a -n -E -i -C 3 'serverName|toolName|kind.{0,20}mcp|kind.{0,20}shell|mcp.{0,50}shell|shell.{0,50}mcp' strings-filtered.txt > strings-context.txt || true
-            echo "inspection complete" > status.txt
-            rm -f "$pkg"
+            grep -a -n -E -i -C 6 'serverName|toolName|kind.{0,30}mcp|kind.{0,30}shell|mcp.{0,80}shell|shell.{0,80}mcp' strings-filtered.txt > strings-context.txt || true
+
+            exe="$(head -n 1 executables.txt || true)"
+            if [ -n "$exe" ]; then
+              "$exe" --version > runtime-version.txt 2>&1 || true
+              "$exe" --help > runtime-help.txt 2>&1 || true
+            fi
             popd >/dev/null
           }
 
@@ -75,35 +70,51 @@ jobs:
           inspect_version '1.0.106-9'
 
           diff -u inspect/1.0.74/package-json-normalized.txt inspect/1.0.106-9/package-json-normalized.txt > inspect/package-json.diff || true
-          diff -u inspect/1.0.74/grep-source.txt inspect/1.0.106-9/grep-source.txt > inspect/grep-source.diff || true
           diff -u inspect/1.0.74/strings-context.txt inspect/1.0.106-9/strings-context.txt > inspect/strings-context.diff || true
 
-          echo '=== package manifests ==='
-          cat inspect/1.0.74/package-json-normalized.txt || true
-          cat inspect/1.0.106-9/package-json-normalized.txt || true
-          echo '=== relevant source hits, 1.0.74 ==='
-          head -n 500 inspect/1.0.74/grep-source.txt || true
-          echo '=== relevant source hits, 1.0.106-9 ==='
-          head -n 500 inspect/1.0.106-9/grep-source.txt || true
-          echo '=== relevant binary strings diff ==='
-          head -n 1000 inspect/strings-context.diff || true
+          echo '=== 1.0.74 tree ==='
+          cat inspect/1.0.74/tree.txt
+          echo '=== 1.0.106-9 tree ==='
+          cat inspect/1.0.106-9/tree.txt
+          echo '=== 1.0.74 runtime ==='
+          cat inspect/1.0.74/runtime-version.txt || true
+          echo '=== 1.0.106-9 runtime ==='
+          cat inspect/1.0.106-9/runtime-version.txt || true
+          echo '=== relevant strings diff ==='
+          head -n 4000 inspect/strings-context.diff || true
 
-      - name: Upload inspection results
+      - name: Upload inspection text
         uses: actions/upload-artifact@v4
         with:
           name: copilot-runtime-inspection
           path: |
-            inspect/**/requested-version.txt
-            inspect/**/status.txt
             inspect/**/npm-pack.json
-            inspect/**/npm-pack.err
             inspect/**/package-sha256.txt
             inspect/**/package-json-normalized.txt
             inspect/**/tree.txt
             inspect/**/filetypes.txt
-            inspect/**/grep-source.txt
+            inspect/**/executables.txt
+            inspect/**/executable-sha256.txt
+            inspect/**/runtime-version.txt
+            inspect/**/runtime-help.txt
             inspect/**/strings-filtered.txt
             inspect/**/strings-context.txt
             inspect/*.diff
-          if-no-files-found: warn
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload vulnerable runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: copilot-linux-x64-1.0.74
+          path: inspect/1.0.74/package
+          compression-level: 0
+          retention-days: 1
+
+      - name: Upload current runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: copilot-linux-x64-1.0.106-9
+          path: inspect/1.0.106-9/package
+          compression-level: 0
           retention-days: 1
