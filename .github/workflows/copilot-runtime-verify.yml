@@ -1,0 +1,109 @@
+name: Copilot CLI runtime verification
+
+on:
+  push:
+    branches:
+      - copilot-runtime-verify-20261105
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Pack and inspect vulnerable and current releases
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p inspect
+
+          inspect_version() {
+            version="$1"
+            out="inspect/$version"
+            mkdir -p "$out"
+            pushd "$out" >/dev/null
+
+            echo "$version" > requested-version.txt
+            if ! npm pack "@github/copilot@$version" --json > npm-pack.json 2> npm-pack.err; then
+              echo "npm pack failed for $version" | tee status.txt
+              cat npm-pack.err
+              popd >/dev/null
+              return 0
+            fi
+
+            pkg="$(node -e "const x=require('./npm-pack.json'); console.log(x[0].filename)")"
+            sha256sum "$pkg" > package-sha256.txt
+            mkdir package
+            tar -xzf "$pkg" -C package --strip-components=1
+
+            node -e "const p=require('./package/package.json'); console.log(JSON.stringify(p,null,2))" > package-json-normalized.txt
+            find package -type f -printf '%s\t%p\n' | sort -n > tree.txt
+            find package -type f -print0 | xargs -0 file > filetypes.txt
+
+            : > grep-source.txt
+            find package -type f \( -name '*.js' -o -name '*.cjs' -o -name '*.mjs' -o -name '*.json' -o -name '*.ts' -o -name '*.map' \) -print0 |
+              xargs -0 -r grep -a -n -E -i 'serverName|toolName|permission|approval|custom-tool|extension-management|kind.{0,20}mcp|kind.{0,20}shell|mcp.{0,50}shell|shell.{0,50}mcp' >> grep-source.txt || true
+
+            : > strings-filtered.txt
+            while IFS= read -r -d '' f; do
+              size=$(stat -c %s "$f")
+              if [ "$size" -le 250000000 ]; then
+                matches=$(LC_ALL=C strings -a "$f" | grep -E -i 'serverName|toolName|permission|approval|custom-tool|extension-management|kind.{0,20}mcp|kind.{0,20}shell|mcp.{0,50}shell|shell.{0,50}mcp' | head -n 20000 || true)
+                if [ -n "$matches" ]; then
+                  printf '\n===== %s =====\n%s\n' "$f" "$matches" >> strings-filtered.txt
+                fi
+              fi
+            done < <(find package -type f -print0)
+
+            grep -a -n -E -i -C 3 'serverName|toolName|kind.{0,20}mcp|kind.{0,20}shell|mcp.{0,50}shell|shell.{0,50}mcp' strings-filtered.txt > strings-context.txt || true
+            echo "inspection complete" > status.txt
+            rm -f "$pkg"
+            popd >/dev/null
+          }
+
+          inspect_version '1.0.74'
+          inspect_version '1.0.106-9'
+
+          diff -u inspect/1.0.74/package-json-normalized.txt inspect/1.0.106-9/package-json-normalized.txt > inspect/package-json.diff || true
+          diff -u inspect/1.0.74/grep-source.txt inspect/1.0.106-9/grep-source.txt > inspect/grep-source.diff || true
+          diff -u inspect/1.0.74/strings-context.txt inspect/1.0.106-9/strings-context.txt > inspect/strings-context.diff || true
+
+          echo '=== package manifests ==='
+          cat inspect/1.0.74/package-json-normalized.txt || true
+          cat inspect/1.0.106-9/package-json-normalized.txt || true
+          echo '=== relevant source hits, 1.0.74 ==='
+          head -n 500 inspect/1.0.74/grep-source.txt || true
+          echo '=== relevant source hits, 1.0.106-9 ==='
+          head -n 500 inspect/1.0.106-9/grep-source.txt || true
+          echo '=== relevant binary strings diff ==='
+          head -n 1000 inspect/strings-context.diff || true
+
+      - name: Upload inspection results
+        uses: actions/upload-artifact@v4
+        with:
+          name: copilot-runtime-inspection
+          path: |
+            inspect/**/requested-version.txt
+            inspect/**/status.txt
+            inspect/**/npm-pack.json
+            inspect/**/npm-pack.err
+            inspect/**/package-sha256.txt
+            inspect/**/package-json-normalized.txt
+            inspect/**/tree.txt
+            inspect/**/filetypes.txt
+            inspect/**/grep-source.txt
+            inspect/**/strings-filtered.txt
+            inspect/**/strings-context.txt
+            inspect/*.diff
+          if-no-files-found: warn
+          retention-days: 1
